@@ -1,36 +1,36 @@
 /**
  * /v1/messages — Anthropic-compatible endpoint
  *
- * Accepts Claude Code / OpenCode requests in Anthropic format,
- * translates them to OpenAI format, forwards to OmniRoute,
- * and returns an Anthropic-format response.
+ * Routes:
+ *  - model starts with "pplx-" → pplxToolLoop (full self-contained tool loop
+ *    against Perplexity web, handles tool_use / tool_result entirely in middleware)
+ *  - all other models → ToolCallAdapter (standard Anthropic ↔ OpenAI translation)
  *
- * Supports:
- *  - Native function calling (when provider supports tool_calls)
- *  - Tool-intent extraction (for plain-text backends like Perplexity web)
+ * Claude Code configuration:
+ *   Base URL:  http://localhost:20128/v1
+ *   API Key:   <your OmniRoute key>
+ *   Model:     pplx-sonar  (or pplx-auto, pplx-gpt, pplx-sonnet, pplx-gemini)
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { ToolCallAdapter } from "@/lib/translation/toolCallAdapter";
+import { runPplxToolLoop } from "@/lib/translation/pplxToolLoop";
 import type { AnthropicRequest } from "@/lib/translation/toolCallAdapter";
 
-// Set USE_INTENT_EXTRACTION=true in .env if using a backend
-// that does NOT natively support function calling (e.g. Perplexity web)
-const USE_INTENT_EXTRACTION =
-  process.env.USE_INTENT_EXTRACTION === "true" ||
-  process.env.USE_INTENT_EXTRACTION === "1";
+const BASE_URL = process.env.BASE_URL ?? "http://localhost:20128";
+const API_KEY = process.env.OMNIROUTE_API_KEY ?? "";
 
+// Standard adapter for non-Perplexity providers
 const adapter = new ToolCallAdapter({
-  useIntentExtraction: USE_INTENT_EXTRACTION,
-  omniRouteBaseUrl: process.env.BASE_URL ?? "http://localhost:20128",
-  omniRouteApiKey: process.env.OMNIROUTE_API_KEY ?? "",
+  useIntentExtraction: false,
+  omniRouteBaseUrl: BASE_URL,
+  omniRouteApiKey: API_KEY,
 });
 
 export async function POST(req: NextRequest) {
   try {
     const body = (await req.json()) as AnthropicRequest;
 
-    // Validate minimum required fields
     if (!body.model || !Array.isArray(body.messages)) {
       return NextResponse.json(
         { error: { type: "invalid_request_error", message: "model and messages are required" } },
@@ -38,7 +38,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const result = await adapter.forward(body);
+    let result: Record<string, unknown>;
+
+    // ── Perplexity web: use dedicated tool loop ──
+    if (body.model.startsWith("pplx-")) {
+      result = await runPplxToolLoop(body, {
+        omniRouteBaseUrl: BASE_URL,
+        omniRouteApiKey: API_KEY,
+        maxIterations: 5,
+      });
+    } else {
+      // ── All other providers: standard OpenAI↔Anthropic adapter ──
+      result = await adapter.forward(body);
+    }
+
     return NextResponse.json(result);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Internal translation error";
@@ -50,11 +63,11 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// Health check
 export async function GET() {
   return NextResponse.json({
     status: "ok",
     layer: "tool-call-translation",
-    useIntentExtraction: USE_INTENT_EXTRACTION,
+    pplxModels: ["pplx-auto", "pplx-sonar", "pplx-gpt", "pplx-sonnet", "pplx-gemini", "pplx-opus"],
+    note: "pplx-* models use the full self-contained tool loop via Perplexity web",
   });
 }
