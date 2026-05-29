@@ -1,273 +1,257 @@
 /**
- * pplxToolLoop.ts
- * ================
- * Full agentic tool-call loop for Perplexity Web.
+ * pplxToolLoop.ts  —  Self-contained Perplexity tool-call loop
  *
- * Problem:
- *   perplexity-web.ts executor drops all tool_calls / tool messages because
- *   parseOpenAIMessages() only handles role:"user" and role:"assistant" text.
- *   Perplexity has no native function-calling — it only returns plain markdown.
+ * No external imports. All types, helpers, and logic live here.
  *
- * Solution:
- *   This module intercepts the request BEFORE it reaches the executor.
- *   It runs the entire tool loop itself:
- *
- *   1. Inject a strict JSON tool-call system prompt into the query
- *   2. Send to Perplexity via OmniRoute → perplexity-web
- *   3. Parse the response for a tool-intent JSON block
- *   4. If found: synthesize Anthropic tool_use → return to Claude Code
- *   5. Claude Code executes the tool, sends back tool_result
- *   6. Adapter converts tool_result back into a follow-up Perplexity message
- *   7. Repeat until Perplexity returns plain text (no tool call)
- *
- * This means the translation layer owns the ENTIRE tool state machine.
- * Perplexity is treated as a dumb text backend.
+ * How it works:
+ *   Perplexity has no native function-calling. This module fakes it by:
+ *   1. Injecting a strict JSON-only system prompt listing available tools
+ *   2. Sending the full conversation to Perplexity via OmniRoute /v1/chat/completions
+ *   3. Parsing the response for a { tool_name, arguments } JSON block
+ *   4. If found: returning stop_reason:"tool_use" to Claude Code
+ *   5. On the next turn (tool_result): serialising the result as plain user text
+ *      and sending back to Perplexity for the final answer
  */
 
 import { randomUUID } from "crypto";
-import type { AnthropicRequest } from "./toolCallAdapter.js";
-import {
-  anthropicToolsToOpenAI,
-  buildToolIntentSystemInstruction,
-  extractToolIntent,
-  toolIntentToAnthropicToolUse,
-  buildAnthropicToolUseResponse,
-  type AnthropicTool,
-  type AnthropicMessage,
-  type AnthropicToolResultBlock,
-} from "./toolCallTranslator.js";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
+// ─── Anthropic wire types ────────────────────────────────────────────────────
+
+export interface AnthropicTool {
+  name: string;
+  description?: string;
+  input_schema?: {
+    type?: string;
+    properties?: Record<string, { type?: string; description?: string }>;
+    required?: string[];
+  };
+}
+
+interface TextBlock      { type: "text"; text: string }
+interface ToolUseBlock   { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+interface ToolResultBlock {
+  type: "tool_result";
+  tool_use_id: string;
+  content: string | Array<{ type: string; text?: string }>;
+}
+type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | { type: string };
+
+export interface AnthropicMessage {
+  role: "user" | "assistant";
+  content: string | ContentBlock[];
+}
+
+export interface AnthropicRequest {
+  model: string;
+  messages: AnthropicMessage[];
+  system?: string;
+  tools?: AnthropicTool[];
+  max_tokens?: number;
+  stream?: boolean;
+}
+
+// ─── Options ─────────────────────────────────────────────────────────────────
 
 export interface PplxLoopOptions {
   omniRouteBaseUrl: string;
   omniRouteApiKey: string;
-  /** Max tool-call iterations before forcing a final answer */
+  /** Hard ceiling on tool-call iterations before forcing a plain text answer */
   maxIterations?: number;
 }
 
-interface OpenAIMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
-  tool_calls?: Array<{
-    id: string;
-    type: "function";
-    function: { name: string; arguments: string };
-  }>;
-  tool_call_id?: string;
-  name?: string;
+// ─── Internal OpenAI message shape ───────────────────────────────────────────
+
+interface OAIMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
 }
 
-// ─── Message builder ─────────────────────────────────────────────────────────
+// ─── Tool intent parsing ─────────────────────────────────────────────────────
+
+interface ToolIntent {
+  tool_name: string;
+  arguments: Record<string, unknown>;
+}
 
 /**
- * Converts an Anthropic messages[] array into OpenAI messages[],
- * specifically handling:
- *  - tool_use blocks in assistant messages → openai tool_calls
- *  - tool_result blocks in user messages → role:"tool" messages
- *  - Serialises tool results as readable text back into the conversation
- *    so Perplexity can understand what happened
+ * Scan the model response for a JSON object containing tool_name + arguments.
+ * Accepts fenced code blocks (```json … ```) or bare JSON anywhere in the text.
  */
-function buildPplxMessages(
-  anthropicMessages: AnthropicMessage[],
+function extractToolIntent(text: string): ToolIntent | null {
+  // Try fenced code block first
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidates = fenced ? [fenced[1]] : [];
+
+  // Also try every {...} span in the response
+  const bareMatches = text.matchAll(/\{[\s\S]*?\}/g);
+  for (const m of bareMatches) candidates.push(m[0]);
+
+  for (const raw of candidates) {
+    try {
+      const parsed = JSON.parse(raw.trim()) as Record<string, unknown>;
+      if (
+        typeof parsed.tool_name === "string" &&
+        parsed.tool_name.length > 0 &&
+        typeof parsed.arguments === "object" &&
+        parsed.arguments !== null
+      ) {
+        return {
+          tool_name: parsed.tool_name,
+          arguments: parsed.arguments as Record<string, unknown>,
+        };
+      }
+    } catch {
+      // not valid JSON, keep trying
+    }
+  }
+  return null;
+}
+
+// ─── System prompt builder ────────────────────────────────────────────────────
+
+function buildSystemPrompt(tools: AnthropicTool[], base?: string): string {
+  const toolDefs = tools
+    .map((t) => {
+      const props = t.input_schema?.properties
+        ? Object.entries(t.input_schema.properties)
+            .map(([k, v]) => `    - ${k} (${v.type ?? "any"}): ${v.description ?? ""}`)
+            .join("\n")
+        : "    (no parameters)";
+      const required = t.input_schema?.required?.join(", ") ?? "none";
+      return [
+        `## Tool: ${t.name}`,
+        t.description ? `Description: ${t.description}` : "",
+        `Parameters:\n${props}`,
+        `Required: ${required}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n\n");
+
+  const instruction = [
+    "You have access to the following tools:",
+    "",
+    toolDefs,
+    "",
+    "RULES (follow exactly):",
+    '1. If you need to call a tool, respond with ONLY a JSON object — no prose before or after:',
+    '   { "tool_name": "<name>", "arguments": { <key>: <value> } }',
+    "2. If no tool is needed, respond in plain text as normal.",
+    "3. Never mix JSON and prose in the same response.",
+    "4. The JSON must be the entire response — no explanation, no markdown wrapper.",
+  ].join("\n");
+
+  return [base?.trim(), instruction].filter(Boolean).join("\n\n");
+}
+
+// ─── Message builder ──────────────────────────────────────────────────────────
+
+/**
+ * Convert Anthropic messages[] to a flat OpenAI-style array that Perplexity
+ * can understand. tool_use / tool_result blocks are serialised as readable text
+ * since Perplexity has no native function-calling protocol.
+ */
+function toOAIMessages(
+  messages: AnthropicMessage[],
   systemPrompt: string
-): OpenAIMessage[] {
-  const result: OpenAIMessage[] = [];
+): OAIMessage[] {
+  const result: OAIMessage[] = [];
 
   if (systemPrompt) {
     result.push({ role: "system", content: systemPrompt });
   }
 
-  for (const msg of anthropicMessages) {
+  for (const msg of messages) {
+    // Plain string content
     if (typeof msg.content === "string") {
-      result.push({ role: msg.role, content: msg.content });
+      result.push({ role: msg.role === "user" ? "user" : "assistant", content: msg.content });
       continue;
     }
 
-    const blocks = msg.content;
+    const blocks = msg.content as ContentBlock[];
 
-    // tool_result blocks → inject as user message with readable tool output
+    // tool_result blocks (role:user) → human-readable text fed back to Perplexity
     const toolResults = blocks.filter(
-      (b): b is AnthropicToolResultBlock => b.type === "tool_result"
+      (b): b is ToolResultBlock => b.type === "tool_result"
     );
     if (toolResults.length > 0) {
       const formatted = toolResults
         .map((r) => {
-          const content =
+          const body =
             typeof r.content === "string"
               ? r.content
-              : r.content.map((c) => ("text" in c ? c.text : "")).join("\n");
-          return `[Tool result for ${r.tool_use_id}]:\n${content}`;
+              : r.content
+                  .map((c) => ("text" in c ? (c as { text: string }).text : ""))
+                  .join("\n");
+          return `[Tool result for call ${r.tool_use_id}]:\n${body}`;
         })
         .join("\n\n");
-      // Perplexity sees this as a user message feeding back the tool output
       result.push({
         role: "user",
-        content: `The tool returned the following result. Use it to continue:\n\n${formatted}`,
+        content: `The tool returned the following result. Use it to answer the user:\n\n${formatted}`,
       });
       continue;
     }
 
-    // tool_use blocks → format as assistant message showing what it called
-    const toolUseBlocks = blocks.filter((b) => b.type === "tool_use");
-    const textBlocks = blocks.filter((b): b is { type: "text"; text: string } => b.type === "text");
+    // tool_use blocks (role:assistant) → show as assistant message
+    const toolUse = blocks.filter((b) => b.type === "tool_use") as ToolUseBlock[];
+    const textBlocks = blocks.filter((b): b is TextBlock => b.type === "text");
 
-    if (toolUseBlocks.length > 0) {
-      const calls = toolUseBlocks
-        .map((b) => {
-          if (b.type !== "tool_use") return "";
-          return `[Called tool ${b.name} with: ${JSON.stringify(b.input)}]`;
-        })
+    if (toolUse.length > 0) {
+      const callDesc = toolUse
+        .map((b) => `[Called tool ${b.name} with: ${JSON.stringify(b.input)}]`)
         .join("\n");
       const text = textBlocks.map((b) => b.text).join("\n");
       result.push({
         role: "assistant",
-        content: [text, calls].filter(Boolean).join("\n"),
+        content: [text, callDesc].filter(Boolean).join("\n"),
       });
       continue;
     }
 
     // Plain text blocks
     const text = textBlocks.map((b) => b.text).join("\n");
-    if (text) result.push({ role: msg.role, content: text });
+    if (text) {
+      result.push({ role: msg.role === "user" ? "user" : "assistant", content: text });
+    }
   }
 
   return result;
 }
 
-// ─── OmniRoute forwarder ─────────────────────────────────────────────────────
+// ─── OmniRoute caller ─────────────────────────────────────────────────────────
 
-/**
- * Sends a plain OpenAI chat/completions request to OmniRoute
- * targeting the perplexity-web executor.
- * Returns the assistant text content.
- */
-async function callPplxViaOmniRoute(
-  messages: OpenAIMessage[],
+async function callOmniRoute(
+  messages: OAIMessage[],
   model: string,
   opts: PplxLoopOptions
 ): Promise<string> {
-  const body = {
-    model,
-    messages,
-    stream: false,
-  };
-
   const res = await fetch(`${opts.omniRouteBaseUrl}/v1/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${opts.omniRouteApiKey}`,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ model, messages, stream: false }),
   });
 
   if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OmniRoute/pplx error ${res.status}: ${err}`);
+    const err = await res.text().catch(() => res.statusText);
+    throw new Error(`OmniRoute error ${res.status}: ${err}`);
   }
 
   const data = (await res.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{ message?: { content?: string | null } }>;
   };
-
   return data.choices?.[0]?.message?.content ?? "";
 }
 
-// ─── Tool-call system prompt ─────────────────────────────────────────────────
+// ─── Response builders ────────────────────────────────────────────────────────
 
-function buildPplxSystemPrompt(tools: AnthropicTool[], baseSystem?: string): string {
-  const toolInstruction = buildToolIntentSystemInstruction(tools);
-
-  // Extra enforcement: tell Perplexity to respond ONLY with the JSON when calling
-  const enforcement = [
-    "",
-    "CRITICAL RULES:",
-    "1. If a tool is needed, output ONLY the JSON object. No explanation before or after.",
-    "2. The JSON must start with { and end with }.",
-    '3. Use this EXACT format: { "tool_name": "<name>", "arguments": { ... } }',
-    "4. If no tool is needed, respond normally in plain text.",
-    "5. Never mix tool JSON with prose in the same response.",
-  ].join("\n");
-
-  return [baseSystem, toolInstruction, enforcement].filter(Boolean).join("\n\n");
-}
-
-// ─── Main loop ───────────────────────────────────────────────────────────────
-
-/**
- * Run the full tool-call agentic loop against Perplexity web.
- *
- * - If the request has no tools, forwards directly and returns an Anthropic text response.
- * - If the request has tools, runs up to maxIterations asking Perplexity for tool JSON,
- *   then returns stop_reason:"tool_use" for Claude Code to execute.
- * - After Claude Code feeds back tool_result, the next call continues the loop.
- */
-export async function runPplxToolLoop(
-  req: AnthropicRequest,
-  opts: PplxLoopOptions
-): Promise<Record<string, unknown>> {
-  const maxIter = opts.maxIterations ?? 1;
-  const model = req.model;
-  const tools = req.tools ?? [];
-
-  // ── No tools: plain passthrough ──
-  if (tools.length === 0) {
-    const messages = buildPplxMessages(req.messages, req.system ?? "");
-    const text = await callPplxViaOmniRoute(messages, model, opts);
-    return buildAnthropicTextResponse(text, model);
-  }
-
-  // ── Check if the latest user turn contains tool_results (continuation) ──
-  // In that case, we already sent tool_use to Claude Code in a previous turn.
-  // Now we need to feed the results back to Perplexity and get the final answer.
-  const lastMsg = req.messages[req.messages.length - 1];
-  const hasToolResults =
-    Array.isArray(lastMsg?.content) &&
-    lastMsg.content.some((b) => b.type === "tool_result");
-
-  if (hasToolResults) {
-    // Build the full conversation including tool results serialized as text
-    const systemPrompt = buildPplxSystemPrompt(tools, req.system);
-    const messages = buildPplxMessages(req.messages, systemPrompt);
-    const text = await callPplxViaOmniRoute(messages, model, opts);
-
-    // Check if Perplexity wants another tool call
-    const intent = extractToolIntent(text);
-    if (intent && maxIter > 0) {
-      const toolUseId = `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-      const toolUseBlock = toolIntentToAnthropicToolUse(intent, toolUseId);
-      return buildAnthropicToolUseResponse([toolUseBlock], model);
-    }
-
-    // No more tool calls — return final text answer
-    return buildAnthropicTextResponse(text, model);
-  }
-
-  // ── Fresh request with tools: ask Perplexity for first tool call ──
-  const systemPrompt = buildPplxSystemPrompt(tools, req.system);
-  const messages = buildPplxMessages(req.messages, systemPrompt);
-  const text = await callPplxViaOmniRoute(messages, model, opts);
-
-  const intent = extractToolIntent(text);
-  if (intent) {
-    const toolUseId = `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
-    const toolUseBlock = toolIntentToAnthropicToolUse(intent, toolUseId);
-    return buildAnthropicToolUseResponse([toolUseBlock], model);
-  }
-
-  // Perplexity answered directly without a tool call
-  return buildAnthropicTextResponse(text, model);
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-function buildAnthropicTextResponse(
-  text: string,
-  model: string
-): Record<string, unknown> {
+function textResponse(text: string, model: string): Record<string, unknown> {
   return {
-    id: `msg_${Date.now()}`,
+    id: `msg_pplx_${Date.now()}`,
     type: "message",
     role: "assistant",
     model,
@@ -279,4 +263,69 @@ function buildAnthropicTextResponse(
       output_tokens: Math.ceil(text.length / 4),
     },
   };
+}
+
+function toolUseResponse(
+  intent: ToolIntent,
+  model: string
+): Record<string, unknown> {
+  const toolUseId = `toolu_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+  return {
+    id: `msg_pplx_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    model,
+    content: [
+      {
+        type: "tool_use",
+        id: toolUseId,
+        name: intent.tool_name,
+        input: intent.arguments,
+      },
+    ],
+    stop_reason: "tool_use",
+    stop_sequence: null,
+    usage: { input_tokens: 0, output_tokens: 0 },
+  };
+}
+
+// ─── Main exported function ───────────────────────────────────────────────────
+
+/**
+ * Run the full agentic tool-call loop against Perplexity web via OmniRoute.
+ *
+ * Handles three cases:
+ *   A) No tools in request  → plain passthrough, returns text response
+ *   B) Tools present, last message has tool_results → feed results back, get final answer
+ *   C) Tools present, fresh request → ask Perplexity for tool JSON or plain answer
+ */
+export async function runPplxToolLoop(
+  req: AnthropicRequest,
+  opts: PplxLoopOptions
+): Promise<Record<string, unknown>> {
+  const model = req.model;
+  const tools = req.tools ?? [];
+  const maxIter = opts.maxIterations ?? 5;
+
+  // Case A: no tools — plain passthrough
+  if (tools.length === 0) {
+    const sysPrompt = req.system ?? "";
+    const msgs = toOAIMessages(req.messages, sysPrompt);
+    const text = await callOmniRoute(msgs, model, opts);
+    return textResponse(text, model);
+  }
+
+  // Case B / C: tools exist — always build system prompt with tool list
+  const sysPrompt = buildSystemPrompt(tools, req.system);
+  const msgs = toOAIMessages(req.messages, sysPrompt);
+  const text = await callOmniRoute(msgs, model, opts);
+
+  // If Perplexity returned a tool intent JSON, return tool_use to Claude Code
+  const intent = extractToolIntent(text);
+  if (intent && maxIter > 0) {
+    return toolUseResponse(intent, model);
+  }
+
+  // No tool call — return plain text answer
+  return textResponse(text, model);
 }
